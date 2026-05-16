@@ -1,0 +1,8 @@
+# Excluded from the pub.dev archive. Consumers don't need our
+# internal tooling, integration tests, or examples that depend on
+# the Pro SDK path.
+.github/
+.idea/
+example_app/
+test/integration/
+tool/
