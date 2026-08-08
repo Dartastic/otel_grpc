@@ -2,9 +2,11 @@
 // Copyright 2025, Mindful Software LLC, All rights reserved.
 
 import 'package:dartastic_opentelemetry/dartastic_opentelemetry.dart';
-import 'package:grpc/grpc.dart';
+// `grpc` also exports a `Server` type; hide it so the unprefixed `Server`
+// below is unambiguously the OTel semconv attribute group.
+import 'package:grpc/grpc.dart' hide Server;
 
-import 'grpc_semantics.dart';
+import 'grpc_status.dart';
 import 'grpc_suppression.dart';
 
 /// OpenTelemetry instrumentation for `package:grpc` outbound calls.
@@ -49,10 +51,16 @@ import 'grpc_suppression.dart';
 ///
 /// | Attribute | Source |
 /// |---|---|
-/// | `rpc.system` | constant `grpc` |
-/// | `rpc.service` | service portion of `ClientMethod.path` |
-/// | `rpc.method` | method portion of `ClientMethod.path` |
-/// | `rpc.grpc.status_code` | numeric code from the response trailers |
+/// | `rpc.system.name` | constant `grpc` |
+/// | `rpc.method` | fully-qualified `<service>/<method>` from `ClientMethod.path` |
+/// | `rpc.response.status_code` | canonical status name (`OK`, `NOT_FOUND`, ...) on completion |
+/// | `server.address` / `server.port` | [serverAddress] / [serverPort] when provided |
+///
+/// `rpc.system` and `rpc.service` are deprecated in the OTel registry and are
+/// no longer emitted: `rpc.system` became `rpc.system.name`, and the service
+/// is folded into `rpc.method`, which is expected to be fully qualified. The
+/// numeric `rpc.grpc.status_code` is likewise deprecated in favor of the
+/// string form on `rpc.response.status_code`.
 ///
 /// - **Span name**: `<service>/<method>` (the gRPC fully-qualified
 ///   path minus the leading slash), per the spec.
@@ -63,15 +71,28 @@ final class OTelGrpcClientInterceptor extends ClientInterceptor {
   ///
   /// - [tracer] — the tracer to use. Defaults to
   ///   `OTel.tracerProvider().getTracer('otel_grpc')`.
-  OTelGrpcClientInterceptor({Tracer? tracer})
-      : _tracer =
-            tracer ?? OTel.tracerProvider().getTracer('otel_grpc'),
+  /// - [serverAddress] / [serverPort] — the channel's host and port,
+  ///   emitted as `server.address` / `server.port`. gRPC interceptors
+  ///   don't see the `ClientChannel`, so pass the same values you gave
+  ///   the channel; omitted attributes are simply not set (never
+  ///   fabricated).
+  OTelGrpcClientInterceptor({
+    Tracer? tracer,
+    this.serverAddress,
+    this.serverPort,
+  })  : _tracer = tracer ?? OTel.tracerProvider().getTracer('otel_grpc'),
         _traceContextPropagator = W3CTraceContextPropagator(),
         _baggagePropagator = W3CBaggagePropagator();
 
   final Tracer _tracer;
   final W3CTraceContextPropagator _traceContextPropagator;
   final W3CBaggagePropagator _baggagePropagator;
+
+  /// Host emitted as `server.address`, when provided.
+  final String? serverAddress;
+
+  /// Port emitted as `server.port`, when provided.
+  final int? serverPort;
 
   @override
   ResponseFuture<R> interceptUnary<Q, R>(
@@ -136,10 +157,14 @@ final class OTelGrpcClientInterceptor extends ClientInterceptor {
 
   APISpan _startSpan(ClientMethod<dynamic, dynamic> method) {
     final (service, methodName) = _splitPath(method.path);
+    // `rpc.system` and `rpc.service` are deprecated in the OTel registry:
+    // `rpc.system` -> `rpc.system.name`, and `rpc.service` folds into
+    // `rpc.method`, which is expected to be fully qualified.
     final attrs = <String, Object>{
-      RPC.rpcSystem.key: 'grpc',
-      if (service != null) RPC.rpcService.key: service,
-      RPC.rpcMethod.key: methodName,
+      Rpc.rpcSystemName.key: 'grpc',
+      Rpc.rpcMethod.key: service != null ? '$service/$methodName' : methodName,
+      if (serverAddress != null) Server.serverAddress.key: serverAddress!,
+      if (serverPort != null) Server.serverPort.key: serverPort!,
     };
     final spanName = service != null ? '$service/$methodName' : methodName;
     return _tracer.startSpan(
@@ -159,7 +184,10 @@ final class OTelGrpcClientInterceptor extends ClientInterceptor {
 
   void _setOk(APISpan span) {
     span.addAttributes(OTel.attributes([
-      OTel.attributeInt(GrpcSemantics.grpcStatusCode.key, 0),
+      OTel.attributeString(
+        Rpc.rpcResponseStatusCode.key,
+        grpcStatusCodeName(StatusCode.ok),
+      ),
     ]));
   }
 
@@ -173,9 +201,12 @@ final class OTelGrpcClientInterceptor extends ClientInterceptor {
 
     final attrs = <Attribute<Object>>[
       if (code != null)
-        OTel.attributeInt(GrpcSemantics.grpcStatusCode.key, code),
+        OTel.attributeString(
+          Rpc.rpcResponseStatusCode.key,
+          grpcStatusCodeName(code),
+        ),
       OTel.attributeString(
-        ErrorResource.errorType.key,
+        ErrorAttributes.errorType.key,
         error.runtimeType.toString(),
       ),
     ];

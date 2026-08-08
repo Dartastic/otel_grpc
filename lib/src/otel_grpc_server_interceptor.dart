@@ -6,12 +6,12 @@ import 'dart:async';
 import 'package:dartastic_opentelemetry/dartastic_opentelemetry.dart';
 import 'package:grpc/grpc.dart' as grpc;
 
-import 'grpc_semantics.dart';
+import 'grpc_status.dart';
 import 'grpc_suppression.dart';
 
 /// OpenTelemetry instrumentation for `package:grpc` inbound calls.
 ///
-/// Attach to a `Server` via its `interceptors` parameter; the
+/// Attach to a `Server` via its `serverInterceptors` parameter; the
 /// interceptor wraps every service-method invocation in a
 /// `SERVER`-kind span, extracts W3C trace context from the incoming
 /// gRPC metadata so the span joins the caller's trace, and sets the
@@ -20,40 +20,46 @@ import 'grpc_suppression.dart';
 /// ```dart
 /// final server = Server.create(
 ///   services: [MyService()],
-///   interceptors: [OTelGrpcServerInterceptor().intercept],
+///   serverInterceptors: [OTelGrpcServerInterceptor()],
 /// );
 /// ```
 ///
-/// Note the `.intercept` suffix: `package:grpc`'s server interceptor
-/// list is typed `List<Interceptor>` where `Interceptor` is a
-/// `typedef` for a function. The class is here mostly to hold the
-/// tracer reference and let you compose configuration; pass the
-/// `intercept` tear-off into the server.
+/// This is `package:grpc`'s class-based `ServerInterceptor`
+/// (available since grpc 4.1.0), which wraps the whole invocation as
+/// middleware — the span covers the real handler execution and ends
+/// when the response stream completes or errors, so durations and
+/// status codes are real. (The older function-typedef `interceptors:`
+/// hook only fires *before* the handler and cannot observe
+/// completion.)
 ///
 /// ## Span shape
 ///
 /// | Attribute | Source |
 /// |---|---|
-/// | `rpc.system` | constant `grpc` |
+/// | `rpc.system.name` | constant `grpc` |
 /// | `rpc.method` | `ServiceMethod.name` |
-/// | `rpc.grpc.status_code` | numeric code on completion or 0 on success |
+/// | `rpc.response.status_code` | `OK` on success; the canonical status name (e.g. `NOT_FOUND`) on a `GrpcError` |
+/// | `error.type` | runtime class of the thrown error | on error |
 ///
-/// (`rpc.service` is not set on the server side — `package:grpc`'s
-/// `ServiceMethod` doesn't carry a back-reference to its parent
-/// `Service`. The client-side interceptor does set it.)
+/// `rpc.method` is unqualified here: `package:grpc`'s `ServiceMethod`
+/// carries no back-reference to its parent `Service`, so the service name
+/// isn't available server-side. The client interceptor emits the fully
+/// qualified form. (`rpc.system` and `rpc.service` are deprecated in the
+/// OTel registry and are not emitted; the numeric `rpc.grpc.status_code`
+/// is likewise deprecated in favor of the string
+/// `rpc.response.status_code`.)
 ///
 /// - **Span name**: `ServiceMethod.name`.
 /// - **Span kind**: `SERVER`.
-/// - **Span status**: `Error` if the call returns a non-OK gRPC
-///   status or throws; otherwise unset.
-final class OTelGrpcServerInterceptor {
-  /// Creates an interceptor holder.
+/// - **Span status**: `Error` if the call throws (including
+///   `GrpcError`); otherwise the SDK default.
+final class OTelGrpcServerInterceptor extends grpc.ServerInterceptor {
+  /// Creates an interceptor.
   ///
   /// - [tracer] — the tracer to use. Defaults to
   ///   `OTel.tracerProvider().getTracer('otel_grpc')`.
   OTelGrpcServerInterceptor({Tracer? tracer})
-      : _tracer =
-            tracer ?? OTel.tracerProvider().getTracer('otel_grpc'),
+      : _tracer = tracer ?? OTel.tracerProvider().getTracer('otel_grpc'),
         _traceContextPropagator = W3CTraceContextPropagator(),
         _baggagePropagator = W3CBaggagePropagator();
 
@@ -61,44 +67,56 @@ final class OTelGrpcServerInterceptor {
   final W3CTraceContextPropagator _traceContextPropagator;
   final W3CBaggagePropagator _baggagePropagator;
 
-  /// Pass `.intercept` as the function in `Server.create(interceptors: ...)`.
-  ///
-  /// gRPC's `Interceptor` typedef is a
-  /// `FutureOr<GrpcError?> Function(ServiceCall, ServiceMethod)`.
-  /// Returning `null` means "continue
-  /// to the handler"; returning a `GrpcError` short-circuits the
-  /// call with that error. We always continue — instrumentation
-  /// observes, it doesn't reject.
-  FutureOr<grpc.GrpcError?> intercept(
+  @override
+  Stream<R> intercept<Q, R>(
     grpc.ServiceCall call,
-    grpc.ServiceMethod<dynamic, dynamic> method,
+    grpc.ServiceMethod<Q, R> method,
+    Stream<Q> requests,
+    grpc.ServerStreamingInvoker<Q, R> invoker,
   ) {
-    if (grpcInstrumentationSuppressed()) return null;
+    if (grpcInstrumentationSuppressed()) {
+      return invoker(call, method, requests);
+    }
 
-    final extractedContext = _extractContext(call);
     final span = _tracer.startSpan(
       method.name,
       kind: SpanKind.server,
-      context: extractedContext,
+      context: _extractContext(call),
       attributes: OTel.attributesFromMap(<String, Object>{
-        RPC.rpcSystem.key: 'grpc',
-        RPC.rpcMethod.key: method.name,
+        // `rpc.system` is deprecated in favour of `rpc.system.name`.
+        Rpc.rpcSystemName.key: 'grpc',
+        Rpc.rpcMethod.key: method.name,
       }),
     );
 
-    // gRPC's Interceptor signature only gives us a hook BEFORE the
-    // call. To finish the span on completion, we register a
-    // callback on `call.trailers` via Future scheduling — when the
-    // framework flushes trailers we know the call is done. The
-    // simplest portable hook is to use a microtask to defer-close
-    // the span at the end of the request's microtask queue. That's
-    // accurate enough for unary calls and the common streaming case.
-    //
-    // A future revision could use ServerStreamingInvoker explicitly
-    // via the `ServerInterceptor` class (instead of the typedef
-    // form), which gives us the stream completion hook.
-    Future<void>.microtask(() => _endSpan(span));
-    return null;
+    var ended = false;
+    void endOnce(void Function() finish) {
+      if (ended) return;
+      ended = true;
+      finish();
+      span.end();
+    }
+
+    Stream<R> responses;
+    try {
+      responses = invoker(call, method, requests);
+    } catch (error, stackTrace) {
+      endOnce(() => _setError(span, error, stackTrace));
+      rethrow;
+    }
+
+    return responses.transform(
+      StreamTransformer<R, R>.fromHandlers(
+        handleError: (Object error, StackTrace stackTrace, EventSink<R> sink) {
+          endOnce(() => _setError(span, error, stackTrace));
+          sink.addError(error, stackTrace);
+        },
+        handleDone: (EventSink<R> sink) {
+          endOnce(() => _setOk(span));
+          sink.close();
+        },
+      ),
+    );
   }
 
   Context _extractContext(grpc.ServiceCall call) {
@@ -109,11 +127,37 @@ final class OTelGrpcServerInterceptor {
     return ctx;
   }
 
-  void _endSpan(APISpan span) {
+  void _setOk(APISpan span) {
     span.addAttributes(OTel.attributes([
-      OTel.attributeInt(GrpcSemantics.grpcStatusCode.key, 0),
+      OTel.attributeString(
+        Rpc.rpcResponseStatusCode.key,
+        grpcStatusCodeName(grpc.StatusCode.ok),
+      ),
     ]));
-    span.end();
+  }
+
+  void _setError(APISpan span, Object error, StackTrace stackTrace) {
+    final attrs = <Attribute<Object>>[
+      if (error is grpc.GrpcError)
+        OTel.attributeString(
+          Rpc.rpcResponseStatusCode.key,
+          grpcStatusCodeName(error.code),
+        ),
+      OTel.attributeString(
+        ErrorAttributes.errorType.key,
+        error.runtimeType.toString(),
+      ),
+    ];
+    span.addAttributes(OTel.attributes(attrs));
+
+    // Spec order: recordException first, THEN setStatus.
+    span.recordException(error, stackTrace: stackTrace);
+    span.setStatus(
+      SpanStatusCode.Error,
+      error is grpc.GrpcError
+          ? (error.message ?? error.toString())
+          : error.toString(),
+    );
   }
 }
 

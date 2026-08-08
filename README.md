@@ -8,21 +8,29 @@ Two interceptors:
 - **`OTelGrpcClientInterceptor`** — attach to a `ClientChannel` to get
   a `CLIENT`-kind span per outbound RPC, with W3C trace context
   injected into the call metadata.
-- **`OTelGrpcServerInterceptor`** — pass `.intercept` into a `Server`'s
-  `interceptors:` list to get a `SERVER`-kind span per inbound RPC,
-  with W3C trace context extracted from the metadata so the span
-  joins the caller's trace.
+- **`OTelGrpcServerInterceptor`** — add to a `Server`'s
+  `serverInterceptors:` list to get a `SERVER`-kind span per inbound
+  RPC, with W3C trace context extracted from the metadata so the span
+  joins the caller's trace. The span wraps the whole handler
+  invocation, so durations and status codes are real.
 
 ```dart
 final channel = ClientChannel(
   'api.example.com',
   options: ChannelOptions(credentials: ChannelCredentials.secure()),
-  interceptors: [OTelGrpcClientInterceptor()],
+  interceptors: [
+    OTelGrpcClientInterceptor(
+      // Optional: interceptors can't see the channel, so pass the
+      // host/port you gave the channel to get server.address/port
+      // on the spans.
+      serverAddress: 'api.example.com',
+    ),
+  ],
 );
 
 final server = Server.create(
   services: [MyService()],
-  interceptors: [OTelGrpcServerInterceptor().intercept],
+  serverInterceptors: [OTelGrpcServerInterceptor()],
 );
 ```
 
@@ -61,11 +69,16 @@ and [gRPC sub-spec](https://opentelemetry.io/docs/specs/semconv/rpc/grpc/).
 
 | Attribute | Source | Set on |
 |---|---|---|
-| `rpc.system` | constant `grpc` | client + server |
-| `rpc.service` | service portion of `ClientMethod.path` | client only (server's `ServiceMethod` doesn't carry the parent `Service`) |
-| `rpc.method` | method portion of the path / `ServiceMethod.name` | client + server |
-| `rpc.grpc.status_code` | numeric gRPC status (0 = OK) | both, on completion |
+| `rpc.system.name` | constant `grpc` | client + server |
+| `rpc.method` | fully-qualified `<service>/<method>` on the client; `ServiceMethod.name` on the server (`ServiceMethod` doesn't carry the parent `Service`) | client + server |
+| `rpc.response.status_code` | canonical status name (`OK`, `NOT_FOUND`, `DEADLINE_EXCEEDED`, ...) | both, on completion |
+| `server.address` / `server.port` | constructor parameters (interceptors can't see the channel) | client, when provided |
 | `error.type` | exception's runtime class | client + server, on error |
+
+The registry-deprecated keys are not emitted: `rpc.system` became
+`rpc.system.name`, `rpc.service` folds into the fully-qualified
+`rpc.method`, and the numeric `rpc.grpc.status_code` became the string
+form on `rpc.response.status_code`.
 
 - **Span name**: `<service>/<method>` on the client (e.g.
   `com.example.UserService/GetUser`); `<method>` on the server.
@@ -89,14 +102,11 @@ join into a single distributed trace automatically.
 
 - Both interceptors call `OTel.tracerProvider().getTracer(...)` in
   their constructors — `OTel.initialize()` must have run first.
-- The server interceptor uses the typedef form of `Interceptor`
-  (the function), not the abstract `ServerInterceptor` class with
-  `intercept<Q,R>`. The typedef only hooks the *start* of the
-  call. The span is ended on the next microtask after the
-  interceptor fires; that's accurate enough for unary calls, but
-  long-lived streaming calls will see their span end before the
-  stream actually completes. A future revision can swap to the
-  `ServerInterceptor` class for full lifecycle wrapping.
+- The server interceptor is the class-based `ServerInterceptor`
+  (`package:grpc` >= 4.1.0), which wraps the whole invocation — the
+  span ends when the response stream completes or errors, so
+  streaming-call durations are real. It goes in `serverInterceptors:`,
+  not the legacy function-typedef `interceptors:` list.
 - Streaming client calls hang completion off `ResponseStream.trailers`,
   which fires after the stream is closed (success) or errors
   (failure) — that's the correct end-of-call signal per

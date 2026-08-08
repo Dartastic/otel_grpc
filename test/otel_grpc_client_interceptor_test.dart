@@ -148,10 +148,11 @@ void main() {
       );
       expect(span.kind, equals(SpanKind.client));
       final attrs = _attrs(span);
-      expect(attrs['rpc.system'], equals('grpc'));
-      expect(attrs['rpc.service'], equals(_serviceName));
-      expect(attrs['rpc.method'], equals(_methodName));
-      expect(attrs['rpc.grpc.status_code'], equals(0));
+      expect(attrs['rpc.system.name'], equals('grpc'));
+      // `rpc.method` is fully qualified per the current registry
+      // (`rpc.service` is deprecated and folded into it).
+      expect(attrs['rpc.method'], equals('$_serviceName/$_methodName'));
+      expect(attrs['rpc.response.status_code'], equals('OK'));
       expect(span.status, isNot(equals(SpanStatusCode.Error)));
     });
 
@@ -187,7 +188,7 @@ void main() {
       );
       expect(span.status, equals(SpanStatusCode.Error));
       final attrs = _attrs(span);
-      expect(attrs['rpc.grpc.status_code'], equals(5));
+      expect(attrs['rpc.response.status_code'], equals('NOT_FOUND'));
       expect(attrs['error.type'], equals('GrpcError'));
       final events = span.spanEvents ?? [];
       expect(events.any((e) => e.name == 'exception'), isTrue);

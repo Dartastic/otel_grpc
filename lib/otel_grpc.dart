@@ -7,7 +7,7 @@
 /// [OTelGrpcServerInterceptor] for inbound calls.
 library;
 
-export 'src/grpc_semantics.dart';
+export 'src/grpc_status.dart';
 export 'src/grpc_suppression.dart';
 export 'src/otel_grpc_client_interceptor.dart';
 export 'src/otel_grpc_server_interceptor.dart';

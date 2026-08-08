@@ -7,7 +7,9 @@
 ///   1. Strips `-wip` from `pubspec.yaml`.
 ///   2. Rewrites `## [X.Y.Z-wip]` in `CHANGELOG.md` to
 ///      `## [X.Y.Z] - YYYY-MM-DD`.
-///   3. Runs `dart pub get`, `dart analyze`, `dart test`.
+///   3. Runs `dart pub get`, then gates on `dart format` being a
+///      no-op and `analyze --fatal-infos --fatal-warnings` being
+///      completely clean, then `dart test`.
 ///   4. Commits as `Release X.Y.Z` and tags `vX.Y.Z`.
 ///   5. Bumps `pubspec.yaml` to next `-wip` (rightmost numeric component
 ///      + 1 by default; `--next X.Y.Z` to override).
@@ -52,6 +54,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:pub_semver/pub_semver.dart';
@@ -121,11 +124,19 @@ Future<void> main(List<String> args) async {
         .any((l) => RegExp(r'^\s*sdk:\s*flutter\s*$').hasMatch(l));
     final runner = isFlutterPkg ? 'flutter' : 'dart';
     _runOrThrow(runner, ['pub', 'get'], silent: true);
-    if (isFlutterPkg) {
-      _runOrThrow(runner, ['analyze', '--no-fatal-infos']);
-    } else {
-      _runOrThrow(runner, ['analyze']);
-    }
+    // Formatting gate: `dart format` must be a no-op. `--set-exit-if-changed`
+    // turns an unformatted file into a hard failure rather than a silent
+    // rewrite mid-release.
+    _runOrThrow(
+      'dart',
+      ['format', '--output=none', '--set-exit-if-changed', '.'],
+    );
+    // Analysis gate: absolutely clean, no exceptions - errors, warnings AND
+    // infos, across lib/, test/, example/ and tool/. `dart analyze` defaults
+    // `--fatal-infos` to false, and `flutter analyze` was being handed
+    // `--no-fatal-infos`, so lint-level diagnostics (e.g. deprecated semconv
+    // members) used to slip silently into published releases.
+    _runOrThrow(runner, ['analyze', '--fatal-infos', '--fatal-warnings']);
     if (flags.skipTests) {
       stdout.writeln('(skipping tests — --skip-tests)');
     } else if (File('tool/test.sh').existsSync() &&
@@ -138,6 +149,10 @@ Future<void> main(List<String> args) async {
     } else {
       _runOrThrow(runner, ['test']);
     }
+    // Score gate: pub.dev runs pana server-side and publishes the result on
+    // the package page. Running it here means a sub-perfect package never
+    // reaches pub.dev in the first place.
+    _assertPerfectPanaScore();
     _runOrThrow('git', [
       'add',
       _pubspecPath,
@@ -679,16 +694,16 @@ Never _die(String msg) {
   exit(1);
 }
 
-/// Verifies that LICENSE matches `publish_to` in pubspec.yaml. OSS
-/// packages (publish_to unset, or `https://pub.dev`) must ship Apache
-/// 2.0; Pro packages (`publish_to: https://pub.dartastic.io`) must
-/// ship the Mindful Software proprietary license, never Apache 2.0.
-/// Fails fast so an OSS package can't accidentally ship a proprietary
-/// LICENSE and vice versa.
+/// Verifies that LICENSE matches `publish_to` in pubspec.yaml. These are
+/// pub.dev packages (publish_to unset, or `https://pub.dev`) and must
+/// ship Apache 2.0. Any other `publish_to:` override means the pubspec
+/// was copied from the wrong template; it must be removed before
+/// releasing. Fails fast so a package can't accidentally ship the wrong
+/// LICENSE.
 void _assertLicensePublishToMatch() {
   final pubspec = File(_pubspecPath).readAsStringSync();
-  final m = RegExp(r'^publish_to:\s*(\S+)\s*$', multiLine: true)
-      .firstMatch(pubspec);
+  final m =
+      RegExp(r'^publish_to:\s*(\S+)\s*$', multiLine: true).firstMatch(pubspec);
   final publishTo = m?.group(1);
 
   if (!File(_licensePath).existsSync()) {
@@ -699,17 +714,8 @@ void _assertLicensePublishToMatch() {
   final isApache =
       head.contains('Apache License') && head.contains('Version 2.0');
 
-  const proPublishTo = 'https://pub.dartastic.io';
-  final isPro = publishTo == proPublishTo;
   final isOss = publishTo == null || publishTo == 'https://pub.dev';
 
-  if (isPro && isApache) {
-    _die(
-      'license/publish_to mismatch: pubspec sets publish_to=$proPublishTo '
-      '(Pro) but LICENSE is Apache 2.0. Pro packages require the Mindful '
-      'Software proprietary license — refusing to publish.',
-    );
-  }
   if (isOss && !isApache) {
     _die(
       'license/publish_to mismatch: pubspec is OSS '
@@ -717,10 +723,69 @@ void _assertLicensePublishToMatch() {
       '2.0. OSS packages must ship Apache 2.0 — refusing to publish.',
     );
   }
-  if (publishTo != null && !isPro && !isOss && publishTo != 'none') {
+  if (publishTo != null && !isOss && publishTo != 'none') {
     _die(
-      'pubspec has publish_to: $publishTo — expected "https://pub.dev" '
-      '(OSS) or "https://pub.dartastic.io" (Pro) or unset.',
+      'pubspec has publish_to: $publishTo. This is a pub.dev package; '
+      'a publish_to override means the pubspec was copied from the wrong '
+      'template. Remove it before releasing.',
     );
   }
+}
+
+/// Refuses to release unless `pana` awards every available point.
+///
+/// pub.dev computes this exact score server-side and shows it on the package
+/// page, so gating on it locally keeps a sub-perfect package from ever being
+/// published.
+///
+/// Note: pana CLONES the `repository:` URL and diffs the pubspec found there
+/// against this one. A fix that exists only in the working tree will still
+/// lose those points — push `main` before releasing.
+void _assertPerfectPanaScore() {
+  stdout.writeln(r'$ dart pub global run pana --no-warning --json .');
+  final r = Process.runSync(
+    'dart',
+    ['pub', 'global', 'run', 'pana', '--no-warning', '--json', '.'],
+  );
+  if (r.exitCode != 0) {
+    _die('pana failed to run (exit ${r.exitCode}).\n'
+        'Install it with `dart pub global activate pana`.\n${r.stderr}');
+  }
+  final Map<String, dynamic> summary;
+  try {
+    summary = jsonDecode(r.stdout as String) as Map<String, dynamic>;
+  } on Object catch (e) {
+    _die('could not parse `pana --json` output: $e');
+  }
+  // Only `sections` is serialized; Report.grantedPoints/maxPoints are
+  // computed getters and never appear in the JSON, so total them here.
+  final report = summary['report'] as Map<String, dynamic>?;
+  final sections = report?['sections'] as List<dynamic>?;
+  if (sections == null || sections.isEmpty) {
+    _die('pana returned no report sections. '
+        'errorMessage=${summary['errorMessage']}');
+  }
+  var granted = 0;
+  var max = 0;
+  final shortfalls = <String>[];
+  for (final s in sections.cast<Map<String, dynamic>>()) {
+    final g = (s['grantedPoints'] as num).toInt();
+    final m = (s['maxPoints'] as num).toInt();
+    granted += g;
+    max += m;
+    if (g < m) {
+      shortfalls.add('  ${s['title']}: $g/$m\n'
+          '${(s['summary'] as String).split('\n').map((l) => '      $l').join('\n')}');
+    }
+  }
+  if (granted < max) {
+    stderr
+      ..writeln()
+      ..writeln('pana score $granted/$max — refusing to publish.');
+    for (final s in shortfalls) {
+      stderr.writeln(s);
+    }
+    _die('every package must score $max/$max before release.');
+  }
+  stdout.writeln('✓ pana $granted/$max');
 }

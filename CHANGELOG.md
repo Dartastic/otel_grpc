@@ -5,41 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0-beta.1-wip]
+## [0.2.0-wip]
 
 ### Added
 
 - `OTelGrpcClientInterceptor` — `ClientInterceptor` subclass that
   wraps every unary and streaming RPC in a `CLIENT`-kind span,
   injects W3C trace context into the call metadata, and maps gRPC
-  status codes to OTel span status. Sets the RPC semconv attributes
-  (`rpc.system=grpc`, `rpc.service`, `rpc.method`,
-  `rpc.grpc.status_code`).
-- `OTelGrpcServerInterceptor` — a holder class whose `intercept`
-  tear-off slots into `Server.create(interceptors: ...)`. Extracts
-  W3C trace context from `ServiceCall.clientMetadata` so server
-  spans parent into the calling trace.
-- `GrpcSemantics` — local enum implementing `OTelSemantic` for the
-  `rpc.grpc.*` keys that aren't in the upstream API's `RPC` enum
-  yet (the package uses the existing `RPC.rpcSystem` / `rpcService`
-  / `rpcMethod` and only ships its own `grpcStatusCode`).
+  status codes to OTel span status. Sets the registry-current RPC
+  semconv attributes: `rpc.system.name=grpc`, fully-qualified
+  `rpc.method`, `rpc.response.status_code` (canonical status name,
+  e.g. `OK` / `NOT_FOUND`). Optional `serverAddress` / `serverPort`
+  constructor parameters emit `server.address` / `server.port`
+  (interceptors can't see the `ClientChannel`, so the values are
+  caller-supplied — never fabricated).
+- `OTelGrpcServerInterceptor` — class-based `ServerInterceptor`
+  (grpc >= 4.1.0) for `Server.create(serverInterceptors: ...)`. The
+  span wraps the whole handler invocation and ends when the response
+  stream completes or errors, so durations and status codes are real
+  (an earlier draft used the function-typedef hook, which fires
+  before the call and cannot observe completion). Extracts W3C trace
+  context from `ServiceCall.clientMetadata` so server spans parent
+  into the calling trace.
+- `grpcStatusCodeName` — canonical gRPC status names for the
+  `rpc.response.status_code` values; unknown codes emit the numeric
+  code as a string.
 - `runWithoutGrpcInstrumentation` /
   `runWithoutGrpcInstrumentationAsync` — zone-scoped suppression
   helpers. The interceptors check a zone flag and skip span
   creation entirely, breaking the recursion hazard when an OTLP/gRPC
   export call would otherwise pass back through the interceptor.
-- 5 unit tests run against a real in-process gRPC `Server`
-  bound to an ephemeral port: happy-path unary call,
-  traceparent injection, GrpcError → Error status, suppression
-  helper, parent-span inheritance.
+- 8 unit tests against a real in-process gRPC `Server` on an
+  ephemeral port: client happy path, traceparent injection,
+  GrpcError → Error status, suppression, parent-span inheritance;
+  server real-duration span, GrpcError mapping, W3C extraction.
+
+### Changed
+
+- Semantic conventions updated to the current OTel registry:
+  registry-deprecated keys are no longer emitted — `rpc.system` →
+  `rpc.system.name`, `rpc.service` → folded into a fully-qualified
+  `rpc.method`, and the numeric `rpc.grpc.status_code` → the string
+  `rpc.response.status_code`. The local `GrpcSemantics` enum is gone
+  with them.
+- Dependency floors raised to `dartastic_opentelemetry ^1.1.0-beta.12`
+  and `dartastic_opentelemetry_api ^1.0.0-rc.1`. The previous floors
+  declared compatibility with API versions that predate the semconv
+  enums this package uses and could not actually resolve-and-compile.
+- `repository` URL corrected to the canonical `Dartastic` org casing so
+  pub.dev repository verification succeeds.
 
 ### Known limitations
 
-- Server-side: `rpc.service` is not set because `package:grpc`'s
+- Server-side `rpc.method` is unqualified: `package:grpc`'s
   `ServiceMethod` doesn't carry a back-reference to its parent
-  `Service`. Client side does set it (from `ClientMethod.path`).
-- Server interceptor uses the typedef-form interceptor hook, which
-  only fires before the call. The span is ended on the next
-  microtask, so long-running streaming calls finish their span
-  before the stream completes. A future revision can switch to
-  the `ServerInterceptor` abstract class for full lifecycle.
+  `Service`. The client emits the fully-qualified form.
