@@ -3,7 +3,7 @@ description: >-
   OpenTelemetry instrumentation for `package:grpc`. Client and server
   interceptors emitting rpc.* spans, propagating W3C trace context via gRPC
   metadata, with recursion suppression.
-version: 0.3.0
+version: 0.3.1-wip
 repository: https://github.com/dartastic/otel_grpc
 homepage: https://dartastic.io
 
