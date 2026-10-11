@@ -3,7 +3,7 @@
 
 import 'dart:async';
 
-import 'package:dartastic_opentelemetry/dartastic_opentelemetry.dart';
+import 'package:dartastic_opentelemetry_api/dartastic_opentelemetry_api.dart';
 import 'package:grpc/grpc.dart' as grpc;
 
 import 'grpc_status.dart';
@@ -58,14 +58,10 @@ final class OTelGrpcServerInterceptor extends grpc.ServerInterceptor {
   ///
   /// - [tracer] — the tracer to use. Defaults to
   ///   `OTel.tracerProvider().getTracer('otel_grpc')`.
-  OTelGrpcServerInterceptor({Tracer? tracer})
-      : _tracer = tracer ?? OTel.tracerProvider().getTracer('otel_grpc'),
-        _traceContextPropagator = W3CTraceContextPropagator(),
-        _baggagePropagator = W3CBaggagePropagator();
+  OTelGrpcServerInterceptor({APITracer? tracer})
+      : _tracer = tracer ?? OTelAPI.tracerProvider().getTracer('otel_grpc');
 
-  final Tracer _tracer;
-  final W3CTraceContextPropagator _traceContextPropagator;
-  final W3CBaggagePropagator _baggagePropagator;
+  final APITracer _tracer;
 
   @override
   Stream<R> intercept<Q, R>(
@@ -82,7 +78,7 @@ final class OTelGrpcServerInterceptor extends grpc.ServerInterceptor {
       method.name,
       kind: SpanKind.server,
       context: _extractContext(call),
-      attributes: OTel.attributesFromMap(<String, Object>{
+      attributes: OTelAPI.attributesFromMap(<String, Object>{
         // `rpc.system` is deprecated in favour of `rpc.system.name`.
         Rpc.rpcSystemName.key: 'grpc',
         Rpc.rpcMethod.key: method.name,
@@ -122,14 +118,14 @@ final class OTelGrpcServerInterceptor extends grpc.ServerInterceptor {
   Context _extractContext(grpc.ServiceCall call) {
     final headers = call.clientMetadata ?? const <String, String>{};
     final getter = _MapGetter(headers);
-    var ctx = _traceContextPropagator.extract(Context.current, headers, getter);
-    ctx = _baggagePropagator.extract(ctx, headers, getter);
-    return ctx;
+    // The app's configured propagators (W3C trace context + baggage by
+    // default; OTEL_PROPAGATORS overrides).
+    return OTelAPI.textMapPropagator.extract(Context.current, headers, getter);
   }
 
   void _setOk(APISpan span) {
-    span.addAttributes(OTel.attributes([
-      OTel.attributeString(
+    span.addAttributes(OTelAPI.attributes([
+      OTelAPI.attributeString(
         Rpc.rpcResponseStatusCode.key,
         grpcStatusCodeName(grpc.StatusCode.ok),
       ),
@@ -139,16 +135,16 @@ final class OTelGrpcServerInterceptor extends grpc.ServerInterceptor {
   void _setError(APISpan span, Object error, StackTrace stackTrace) {
     final attrs = <Attribute<Object>>[
       if (error is grpc.GrpcError)
-        OTel.attributeString(
+        OTelAPI.attributeString(
           Rpc.rpcResponseStatusCode.key,
           grpcStatusCodeName(error.code),
         ),
-      OTel.attributeString(
+      OTelAPI.attributeString(
         ErrorAttributes.errorType.key,
         error.runtimeType.toString(),
       ),
     ];
-    span.addAttributes(OTel.attributes(attrs));
+    span.addAttributes(OTelAPI.attributes(attrs));
 
     // Spec order: recordException first, THEN setStatus.
     span.recordException(error, stackTrace: stackTrace);
