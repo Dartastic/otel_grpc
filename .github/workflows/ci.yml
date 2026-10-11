@@ -16,6 +16,12 @@ jobs:
         sdk: [stable, beta]
     steps:
       - uses: actions/checkout@v4
+      - name: lib/ depends on the OpenTelemetry API only
+        run: |
+          if grep -rn "package:dartastic_opentelemetry/" lib/; then
+            echo "lib/ must import dartastic_opentelemetry_api only; the app chooses the SDK." >&2
+            exit 1
+          fi
       - uses: dart-lang/setup-dart@v1
         with:
           sdk: ${{ matrix.sdk }}

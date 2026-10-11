@@ -1,7 +1,7 @@
 // Licensed under the Apache License, Version 2.0
 // Copyright 2025, Mindful Software LLC, All rights reserved.
 
-import 'package:dartastic_opentelemetry/dartastic_opentelemetry.dart';
+import 'package:dartastic_opentelemetry_api/dartastic_opentelemetry_api.dart';
 // `grpc` also exports a `Server` type; hide it so the unprefixed `Server`
 // below is unambiguously the OTel semconv attribute group.
 import 'package:grpc/grpc.dart' hide Server;
@@ -77,16 +77,12 @@ final class OTelGrpcClientInterceptor extends ClientInterceptor {
   ///   the channel; omitted attributes are simply not set (never
   ///   fabricated).
   OTelGrpcClientInterceptor({
-    Tracer? tracer,
+    APITracer? tracer,
     this.serverAddress,
     this.serverPort,
-  })  : _tracer = tracer ?? OTel.tracerProvider().getTracer('otel_grpc'),
-        _traceContextPropagator = W3CTraceContextPropagator(),
-        _baggagePropagator = W3CBaggagePropagator();
+  }) : _tracer = tracer ?? OTelAPI.tracerProvider().getTracer('otel_grpc');
 
-  final Tracer _tracer;
-  final W3CTraceContextPropagator _traceContextPropagator;
-  final W3CBaggagePropagator _baggagePropagator;
+  final APITracer _tracer;
 
   /// Host emitted as `server.address`, when provided.
   final String? serverAddress;
@@ -170,21 +166,22 @@ final class OTelGrpcClientInterceptor extends ClientInterceptor {
     return _tracer.startSpan(
       spanName,
       kind: SpanKind.client,
-      attributes: OTel.attributesFromMap(attrs),
+      attributes: OTelAPI.attributesFromMap(attrs),
     );
   }
 
   CallOptions _injectContext(CallOptions options, APISpan span) {
     final headers = <String, String>{};
     final ctx = Context.current.withSpan(span);
-    _traceContextPropagator.inject(ctx, headers, _MapSetter(headers));
-    _baggagePropagator.inject(ctx, headers, _MapSetter(headers));
+    // The app's configured propagators (W3C trace context + baggage by
+    // default; OTEL_PROPAGATORS overrides).
+    OTelAPI.textMapPropagator.inject(ctx, headers, _MapSetter(headers));
     return options.mergedWith(CallOptions(metadata: headers));
   }
 
   void _setOk(APISpan span) {
-    span.addAttributes(OTel.attributes([
-      OTel.attributeString(
+    span.addAttributes(OTelAPI.attributes([
+      OTelAPI.attributeString(
         Rpc.rpcResponseStatusCode.key,
         grpcStatusCodeName(StatusCode.ok),
       ),
@@ -201,16 +198,16 @@ final class OTelGrpcClientInterceptor extends ClientInterceptor {
 
     final attrs = <Attribute<Object>>[
       if (code != null)
-        OTel.attributeString(
+        OTelAPI.attributeString(
           Rpc.rpcResponseStatusCode.key,
           grpcStatusCodeName(code),
         ),
-      OTel.attributeString(
+      OTelAPI.attributeString(
         ErrorAttributes.errorType.key,
         error.runtimeType.toString(),
       ),
     ];
-    span.addAttributes(OTel.attributes(attrs));
+    span.addAttributes(OTelAPI.attributes(attrs));
 
     // Spec order: recordException first, THEN setStatus.
     span.recordException(error, stackTrace: stackTrace);
