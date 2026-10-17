@@ -2,7 +2,7 @@ name: otel_grpc
 description: >-
   OpenTelemetry instrumentation for grpc by Dartastic.io. Adds standard
   OpenTelemetry observability to applications that use grpc.
-version: 0.3.1
+version: 0.3.2-wip
 repository: https://github.com/dartastic/otel_grpc
 homepage: https://dartastic.io
 
